@@ -40,7 +40,7 @@ services:
         monitor: 15s
 
   dbcontroller:
-    image: jackietreehorn/mongo-replica-ctrl:latest
+    image: petronem/mongo-replica-ctrl:latest
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - acme-letsencrypt:/etc/letsencrypt:ro

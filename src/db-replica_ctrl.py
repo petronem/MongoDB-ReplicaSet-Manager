@@ -32,6 +32,10 @@ from contextlib import contextmanager
 import logging
 import traceback
 import os
+import hashlib
+import re
+import socket
+import ssl
 import pymongo as pm
 import sys
 import time
@@ -113,24 +117,42 @@ def get_required_env_variables():
         'MONGO_ROOT_PASSWORD',
         'INITDB_DATABASE',
         'INITDB_USER',
-        'INITDB_PASSWORD'
+        'INITDB_PASSWORD',
+        'MONGO_CERTIFICATE_FILE',
+        'MONGO_CA_FILE'
     ]
     envs = {}
     for rv in REQUIRED_VARS:
-        found = False
-        for env_var in os.environ:
-            if env_var.lower() == rv.lower():
-                envs[rv.lower()] = os.environ[env_var]
-                found = True
-                break
-        if not found:
-            envs[rv.lower()] = None
+        env_value = next((os.environ[key] for key in os.environ if key.lower() == rv.lower()), None)
+        file_value = next((os.environ[key] for key in os.environ if key.lower() == (rv + '_file').lower()), None)
+        if env_value is not None and file_value is not None:
+            raise RuntimeError("Set either {} or {}_FILE, not both.".format(rv, rv))
+        if file_value is not None:
+            try:
+                with open(file_value, encoding='utf-8') as secret_file:
+                    env_value = secret_file.read().rstrip('\r\n')
+            except OSError as error:
+                raise RuntimeError("Could not read secret file for {}: {}".format(rv, error)) from error
+        envs[rv.lower()] = env_value
 
     if not all(value is not None for value in envs.values()):
         missing_vars = [var for var, value in envs.items() if value is None]
         raise RuntimeError(f"Missing required ENV variables: {missing_vars}")
 
     envs['mongo_port'] = int(envs['mongo_port']) if envs['mongo_port'] is not None else None
+    raw_horizon_suffix = os.environ.get('MONGO_HORIZON_SUFFIX', '').strip()
+    envs['mongo_horizon_suffix'] = raw_horizon_suffix.strip('.').lower()
+    envs['mongo_horizon_name'] = os.environ.get('MONGO_HORIZON_NAME', 'external').strip()
+
+    suffix_labels = envs['mongo_horizon_suffix'].split('.')
+    if raw_horizon_suffix != envs['mongo_horizon_suffix']:
+        raise RuntimeError('MONGO_HORIZON_SUFFIX must be lowercase and must not have a trailing dot.')
+    if len(suffix_labels) < 3 or not envs['mongo_horizon_name'] or any(
+        not label or len(label) > 63 or not label[0].isalnum() or not label[-1].isalnum()
+        or any(not (char.isalnum() or char == '-') for char in label)
+        for label in suffix_labels
+    ):
+        raise RuntimeError('MONGO_HORIZON_SUFFIX must be env.domain.tld and MONGO_HORIZON_NAME must be a DNS label.')
 
     return envs
 
@@ -218,6 +240,145 @@ def get_tasks_ips(tasks, overlay_network_name):
     return tasks_ips
 
 
+def get_task_member_labels(tasks, overlay_network_name):
+    """Map each running Mongo task's overlay IP to its numeric Swarm mongo label."""
+    with docker_client() as dc:
+        node_labels = {
+            node.id: node.attrs.get('Spec', {}).get('Labels') or {}
+            for node in dc.nodes.list()
+        }
+
+    member_labels = {}
+    for task in tasks:
+        node_id = task.get('NodeID')
+        label = node_labels.get(node_id, {}).get('mongo')
+        try:
+            member_number = int(label)
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "Mongo task on node {} has no numeric 'mongo' label.".format(node_id)
+            )
+        if member_number < 1:
+            raise RuntimeError("Node label 'mongo' must be a positive integer.")
+
+        for network in task.get('NetworksAttachments', []):
+            if network.get('Network', {}).get('Spec', {}).get('Name') == overlay_network_name:
+                ip = network['Addresses'][0].split('/')[0]
+                if ip in member_labels:
+                    raise RuntimeError("Multiple Mongo tasks have the same overlay IP {}.".format(ip))
+                member_labels[ip] = member_number
+                break
+
+    if len(set(member_labels.values())) != len(member_labels):
+        raise RuntimeError("Each Mongo node must have a unique numeric 'mongo' label.")
+    return member_labels
+
+
+def get_task_ip(task, overlay_network_name):
+    for network in task.get('NetworksAttachments', []):
+        if network.get('Network', {}).get('Spec', {}).get('Name') == overlay_network_name:
+            return network['Addresses'][0].split('/')[0]
+    return None
+
+
+def external_horizon_address(member_number, mongo_port, horizon_suffix):
+    return "mongo{}.db.{}:{}".format(member_number, horizon_suffix, mongo_port)
+
+
+def get_certificate_fingerprint(certificate_file):
+    with open(certificate_file, 'rb') as pem_file:
+        pem = pem_file.read()
+    match = re.search(rb'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', pem, re.DOTALL)
+    if not match:
+        raise ValueError("No PEM certificate found in {}.".format(certificate_file))
+    certificate_der = ssl.PEM_cert_to_DER_cert(match.group().decode('ascii'))
+    return hashlib.sha256(certificate_der).hexdigest()
+
+
+def get_certificate_bundle_fingerprint(certificate_file, ca_file):
+    with open(certificate_file, 'rb') as pem_file:
+        certificate_bundle = pem_file.read()
+    with open(ca_file, 'rb') as ca_bundle_file:
+        ca_bundle = ca_bundle_file.read()
+    return hashlib.sha256(certificate_bundle + b'\0' + ca_bundle).hexdigest()
+
+
+def get_presented_certificate_fingerprint(host, port, ca_file):
+    context = ssl.create_default_context(cafile=ca_file)
+    context.check_hostname = False
+    with socket.create_connection((host, port), timeout=5) as connection:
+        with context.wrap_socket(connection) as tls_connection:
+            return hashlib.sha256(tls_connection.getpeercert(binary_form=True)).hexdigest()
+
+
+def rotate_task_certificate(host, port, username, password, expected_fingerprint, ca_file):
+    client = pm.MongoClient(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        authSource='admin',
+        directConnection=True,
+        tls=False,
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000,
+        socketTimeoutMS=10000
+    )
+    try:
+        client.admin.command('rotateCertificates')
+    finally:
+        client.close()
+
+    for attempt in range(10):
+        try:
+            if get_presented_certificate_fingerprint(host, port, ca_file) == expected_fingerprint:
+                return True
+        except (OSError, ssl.SSLError):
+            pass
+        if attempt < 9:
+            time.sleep(2)
+    return False
+
+
+def rotate_changed_certificates(tasks, overlay_network_name, mongo_port, mongo_root_username, mongo_root_password, certificate_file, ca_file, applied_bundles, last_attempts):
+    logger = logging.getLogger(__name__)
+    try:
+        expected_fingerprint = get_certificate_fingerprint(certificate_file)
+        bundle_fingerprint = get_certificate_bundle_fingerprint(certificate_file, ca_file)
+    except (OSError, ValueError) as error:
+        logger.warning("Certificate rotation deferred: {}".format(error))
+        return
+
+    active_task_ids = {task.get('ID') for task in tasks}
+    for task_id in set(applied_bundles) - active_task_ids:
+        applied_bundles.pop(task_id, None)
+        last_attempts.pop(task_id, None)
+
+    now = time.monotonic()
+    for task in tasks:
+        task_id = task.get('ID')
+        host = get_task_ip(task, overlay_network_name)
+        if not task_id or not host or applied_bundles.get(task_id) == bundle_fingerprint:
+            continue
+        last_attempt = last_attempts.get(task_id)
+        if last_attempt and last_attempt[0] == bundle_fingerprint and now - last_attempt[1] < 30:
+            continue
+
+        last_attempts[task_id] = (bundle_fingerprint, now)
+        try:
+            logger.info("Reloading TLS certificates on MongoDB task {} ({})".format(task_id[:12], host))
+            if rotate_task_certificate(
+                host, mongo_port, mongo_root_username, mongo_root_password,
+                expected_fingerprint, ca_file
+            ):
+                applied_bundles[task_id] = bundle_fingerprint
+                logger.info("MongoDB task {} now serves the current TLS certificate.".format(task_id[:12]))
+            else:
+                logger.warning("MongoDB task {} has not presented the new certificate yet; will retry.".format(task_id[:12]))
+        except Exception as error:
+            logger.warning("Could not rotate TLS certificate on MongoDB task {}: {}".format(task_id[:12], error))
+
+
 def setup_initial_database(current_member_ips, mongo_port, mongo_root_username, mongo_root_password, initdb_database, initdb_user, initdb_password):
     """
     Sets up the initial database with a user and an entry in the users collection.
@@ -277,7 +438,7 @@ def setup_initial_database(current_member_ips, mongo_port, mongo_root_username, 
         client.close()
 
 
-def init_replica(mongo_tasks, mongo_tasks_ips, replicaset_name, mongo_port, mongo_root_username, mongo_root_password, retry_attempts=6, retry_delay=10):
+def init_replica(mongo_tasks, mongo_tasks_ips, replicaset_name, mongo_port, mongo_root_username, mongo_root_password, member_labels=None, horizon_suffix='', horizon_name='external', retry_attempts=6, retry_delay=10):
     """
     Init a MongoDB replicaset from the scratch.
     """
@@ -301,7 +462,7 @@ def init_replica(mongo_tasks, mongo_tasks_ips, replicaset_name, mongo_port, mong
         task_container_id = task['Status']['ContainerStatus']['ContainerID']
         logger.debug("Task ID: {}, Status: {}, Container ID: {}, IP: {}".format(task_id, task_status, task_container_id, task_ip))
 
-    config = create_mongo_config(mongo_tasks_ips, replicaset_name, mongo_port)
+    config = create_mongo_config(mongo_tasks_ips, replicaset_name, mongo_port, member_labels, horizon_suffix, horizon_name)
     config_str = json.dumps(config)  # Serialize config to json formatted string
     logger.debug("Initial config Built: {}".format(config))
 
@@ -498,15 +659,22 @@ def create_mongodb_root_user(containerId, mongo_root_username, mongo_root_passwo
         logger.error(f"Unexpected error creating root user: {e}")
 
 
-def create_mongo_config(tasks_ips, replicaset_name, mongo_port):
+def create_mongo_config(tasks_ips, replicaset_name, mongo_port, member_labels=None, horizon_suffix='', horizon_name='external'):
     logger = logging.getLogger(__name__)
 
     members = []
+    if member_labels:
+        tasks_ips = sorted(tasks_ips, key=lambda ip: (member_labels[ip], ip))
     for i, ip in enumerate(tasks_ips):
-        members.append({
-          '_id': i,
-          'host': "{}:{}".format(ip, mongo_port)
-        })
+        member = {
+            '_id': i,
+            'host': "{}:{}".format(ip, mongo_port)
+        }
+        if horizon_suffix:
+            member['horizons'] = {
+                horizon_name: external_horizon_address(member_labels[ip], mongo_port, horizon_suffix)
+            }
+        members.append(member)
     config = {
         '_id': replicaset_name,
         'members': members,
@@ -715,21 +883,17 @@ def is_replica_set_uninitialized(tasks_ips, mongo_port):
 #     return primary_ip
 
 
-def update_config(primary_ip, current_ips, new_ips, mongo_port, mongo_root_username, mongo_root_password):
+def update_config(primary_ip, current_ips, new_ips, mongo_port, mongo_root_username, mongo_root_password, member_labels=None, horizon_suffix='', horizon_name='external'):
 
     logger = logging.getLogger(__name__)
 
     to_remove = set(current_ips) - set(new_ips)
     to_add = set(new_ips) - set(current_ips)
 
-    if not (to_remove or to_add) and current_ips:
-        logger.info("Config update - no IP changes to add/remove")
-        force = True
-    else:
-        assert to_remove or to_add
-        force = False
+    if not (to_remove or to_add) and not horizon_suffix:
+        logger.info("Config update - no IP or horizon changes requested")
+        return
 
-    # Force reconfiguration when significant changes are detected
     force = len(to_remove) > 1 or len(to_add) > 1
 
     if primary_ip in to_remove or primary_ip is None:
@@ -803,11 +967,29 @@ def update_config(primary_ip, current_ips, new_ips, mongo_port, mongo_root_usern
             else:
                 offset = 0
 
-            for i, ip in enumerate(to_add):
+            ordered_additions = sorted(to_add, key=lambda ip: (member_labels.get(ip, float('inf')), ip))
+            for i, ip in enumerate(ordered_additions):
                 config['members'].append({
                     '_id': offset + i,
                     'host': "{}:{}".format(ip, mongo_port)
                 })
+
+        horizons_changed = False
+        if horizon_suffix:
+            for member in config['members']:
+                ip = member['host'].rsplit(':', 1)[0]
+                if ip not in member_labels:
+                    raise RuntimeError("No Swarm mongo label found for replica-set member {}.".format(ip))
+                horizons = dict(member.get('horizons') or {})
+                address = external_horizon_address(member_labels[ip], mongo_port, horizon_suffix)
+                if horizons.get(horizon_name) != address:
+                    horizons[horizon_name] = address
+                    member['horizons'] = horizons
+                    horizons_changed = True
+
+        if not (to_remove or to_add or horizons_changed):
+            logger.info("Config update - replica-set members and horizons are already current")
+            return
 
         # Incrementing 'version' (not incrementing 'term' as mongo handles it automatically
         config['version'] += 1
@@ -894,7 +1076,7 @@ def update_config(primary_ip, current_ips, new_ips, mongo_port, mongo_root_usern
 #             logger.error(f"Failed to adjust election timeout: {str(e)}")
 
 
-def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_port, mongo_root_username, mongo_root_password, initdb_database, initdb_user, initdb_password):
+def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_port, mongo_root_username, mongo_root_password, initdb_database, initdb_user, initdb_password, mongo_horizon_suffix='', mongo_horizon_name='external', mongo_certificate_file='', mongo_ca_file=''):
     """
     To manage the replica:
     - Configure replicaset
@@ -917,7 +1099,9 @@ def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_p
 
     # Get mongo tasks ips
     mongo_tasks = get_running_tasks(mongo_service)
-    mongo_tasks_ips = get_tasks_ips(mongo_tasks, overlay_network_name)
+    member_labels = get_task_member_labels(mongo_tasks, overlay_network_name)
+    current_member_labels = member_labels
+    mongo_tasks_ips = list(member_labels)
     logger.info("Mongo tasks ips: {}".format(mongo_tasks_ips))
 
     current_member_ips = gather_configured_members_ips(mongo_tasks_ips, mongo_port, mongo_root_username, mongo_root_password)
@@ -936,25 +1120,59 @@ def manage_replica(mongo_service, overlay_network_name, replicaset_name, mongo_p
         # Starting from the scratch or a fresh deployment
         logger.info("No previous replicaSet configuration found - proceeding with fresh initialization...")
         current_member_ips = set(mongo_tasks_ips)
-        init_replica(mongo_tasks, current_member_ips, replicaset_name, mongo_port, mongo_root_username, mongo_root_password)
+        init_replica(
+            mongo_tasks, current_member_ips, replicaset_name, mongo_port,
+            mongo_root_username, mongo_root_password, member_labels,
+            mongo_horizon_suffix, mongo_horizon_name
+        )
         setup_initial_database(current_member_ips, mongo_port, mongo_root_username, mongo_root_password, initdb_database, initdb_user, initdb_password)
     elif set(current_member_ips) != set(mongo_tasks_ips):
         # Redeployment detected - existing config but different IPs
         logger.info("Redeployment detected - updating configuration immediately...")
-        update_config(primary_ip, current_member_ips, set(mongo_tasks_ips), mongo_port, mongo_root_username, mongo_root_password)
+        update_config(
+            primary_ip, current_member_ips, set(mongo_tasks_ips), mongo_port,
+            mongo_root_username, mongo_root_password, member_labels,
+            mongo_horizon_suffix, mongo_horizon_name
+        )
         current_member_ips = set(mongo_tasks_ips)
         primary_ip = get_primary_ip(mongo_tasks_ips, mongo_port, mongo_root_username, mongo_root_password)
     else:
         logger.info("Existing replicaSet configuration matches current deployment - monitoring for changes...")
+        if mongo_horizon_suffix:
+            update_config(
+                primary_ip, current_member_ips, set(mongo_tasks_ips), mongo_port,
+                mongo_root_username, mongo_root_password, member_labels,
+                mongo_horizon_suffix, mongo_horizon_name
+            )
+
+    applied_certificate_bundles = {}
+    certificate_rotation_attempts = {}
+    rotate_changed_certificates(
+        mongo_tasks, overlay_network_name, mongo_port, mongo_root_username,
+        mongo_root_password, mongo_certificate_file, mongo_ca_file,
+        applied_certificate_bundles, certificate_rotation_attempts
+    )
 
     # Watch for IP changes. If IPs remain stable we assume MongoDB maintains the replicaset working fine.
     while True:
         time.sleep(10)
-        new_member_ips = set(get_tasks_ips(get_running_tasks(mongo_service), overlay_network_name))
-        if current_member_ips.symmetric_difference(new_member_ips):
+        mongo_tasks = get_running_tasks(mongo_service)
+        rotate_changed_certificates(
+            mongo_tasks, overlay_network_name, mongo_port, mongo_root_username,
+            mongo_root_password, mongo_certificate_file, mongo_ca_file,
+            applied_certificate_bundles, certificate_rotation_attempts
+        )
+        new_member_labels = get_task_member_labels(mongo_tasks, overlay_network_name)
+        new_member_ips = set(new_member_labels)
+        if current_member_ips.symmetric_difference(new_member_ips) or current_member_labels != new_member_labels:
             logger.info("Detected change in member IPs - Updating configuration...")
-            update_config(primary_ip, current_member_ips, new_member_ips, mongo_port, mongo_root_username, mongo_root_password)
+            update_config(
+                primary_ip, current_member_ips, new_member_ips, mongo_port,
+                mongo_root_username, mongo_root_password, new_member_labels,
+                mongo_horizon_suffix, mongo_horizon_name
+            )
         current_member_ips = new_member_ips
+        current_member_labels = new_member_labels
         primary_ip = get_primary_ip(new_member_ips, mongo_port, mongo_root_username, mongo_root_password)
 
 

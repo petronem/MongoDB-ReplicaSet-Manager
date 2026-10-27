@@ -2,17 +2,25 @@ version: '3.9'
 services:
   database:
     image: mongo:${MONGO_VERSION}
-    entrypoint: [ "/usr/bin/mongod", "--keyFile", "/run/secrets/mongo-keyfile", "--replSet", "${REPLICASET_NAME}", "--dbpath", "/data/db", "--bind_ip", "0.0.0.0"]
+    entrypoint: [ "/usr/bin/mongod", "--keyFile", "/run/secrets/mongo-keyfile", "--replSet", "${REPLICASET_NAME}", "--dbpath", "/data/db", "--bind_ip", "0.0.0.0", "--tlsMode", "preferTLS", "--tlsCertificateKeyFile", "/etc/letsencrypt/service/mongo/${MONGO_HORIZON_SUFFIX}.pem", "--tlsCAFile", "/etc/letsencrypt/service/mongo/root.pem", "--tlsAllowInvalidHostnames"]
     secrets:
       - source: mongo-keyfile
+        uid: "999"
+        gid: "999"
         mode: 0400
     configs:
       - mongo-healthcheck
     volumes:
       - mongodata:/data/db:rw
       - mongoconfigdb:/data/configdb:rw
+      - acme-letsencrypt:/etc/letsencrypt:ro
     networks:
       - backend
+    ports:
+      - target: 27017
+        published: 27017
+        protocol: tcp
+        mode: host
     healthcheck:
       test: ["CMD-SHELL", "sh /mongo-healthcheck"]
       interval: 1m
@@ -21,6 +29,9 @@ services:
       start_period: 10s
     deploy:
       mode: global
+      placement:
+        constraints:
+          - node.labels.mongo-member == true
       restart_policy:
         condition: on-failure
       update_config:
@@ -32,17 +43,25 @@ services:
     image: jackietreehorn/mongo-replica-ctrl:latest
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - acme-letsencrypt:/etc/letsencrypt:ro
     environment:
       OVERLAY_NETWORK_NAME: ${BACKEND_NETWORK_NAME}
       MONGO_SERVICE_NAME: ${MONGO_SERVICE_URI}
+      MONGO_HORIZON_SUFFIX: ${MONGO_HORIZON_SUFFIX}
+      MONGO_HORIZON_NAME: ${MONGO_HORIZON_NAME}
+      MONGO_CERTIFICATE_FILE: /etc/letsencrypt/service/mongo/${MONGO_HORIZON_SUFFIX}.pem
+      MONGO_CA_FILE: /etc/letsencrypt/service/mongo/root.pem
       REPLICASET_NAME: ${REPLICASET_NAME}
       MONGO_PORT: 27017
       MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
-      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_ROOT_PASSWORD_FILE: /run/secrets/mongo-root-password
       INITDB_DATABASE: ${INITDB_DATABASE}
       INITDB_USER: ${INITDB_USER}
-      INITDB_PASSWORD: ${INITDB_PASSWORD}
+      INITDB_PASSWORD_FILE: /run/secrets/initdb-password
       DEBUG: 0
+    secrets:
+      - mongo-root-password
+      - initdb-password
     entrypoint: python /src/db-replica_ctrl.py
     networks:
       - backend
@@ -63,7 +82,9 @@ services:
   nosqlclient:
     image: mongoclient/mongoclient:latest
     environment:
-      - MONGOCLIENT_DEFAULT_CONNECTION_URL=mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@database:27017/?replicaSet=${REPLICASET_NAME}
+      MONGOCLIENT_DEFAULT_CONNECTION_URL_FILE: /run/secrets/mongo-client-url
+    secrets:
+      - mongo-client-url
     depends_on:
       - database
     ports:
@@ -90,6 +111,15 @@ configs:
 secrets:
    mongo-keyfile:
      external: true
+   mongo-root-password:
+     external: true
+     name: ${STACK_NAME}_mongo_root_password
+   initdb-password:
+     external: true
+     name: ${STACK_NAME}_initdb_password
+   mongo-client-url:
+     external: true
+     name: ${STACK_NAME}_mongo_client_url
 
 volumes:
   # NOTE: Must use 'external' for db volumes so they're not recreated during redeployments
@@ -99,6 +129,9 @@ volumes:
   mongoconfigdb:
     external: true
     name: ${STACK_NAME}_mongoconfigdb
+  acme-letsencrypt:
+    external: true
+    name: acme_rsync_letsencrypt
 
 networks:
   backend:

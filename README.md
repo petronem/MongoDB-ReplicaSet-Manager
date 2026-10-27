@@ -5,6 +5,8 @@
 <p align="center">
   - Allow for external access to Mongo Service without running VPN/etc by using External Horizons w/ rs.Config.
   <br>
+  - Add TLS on connections now that they are going outside the SWARM ( I already use an ACME-DNS server and have acme-rsync helpers in my swarms)
+  <br>
   - Use Swarm Secrets instead of passwords stored in .Env files
   <br>
   - Possibly use Swarm Config(s) to replace deploy.sh
@@ -156,22 +158,59 @@ graph TD
 
 1. Set all required environment variables in [`mongo-rs.env`](./mongo-rs.env) (see [Environment Variables](#environment-variables) below).
 
-2. Modify `docker-compose-stack.yml` to include your application service. Set your app's MongoDB URI to:
+2. Label each MongoDB Swarm node with its unique positive member number and the shared placement label:
 
-    ```
-    mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@database:27017/?replicaSet=${REPLICASET_NAME}
-    ```
+  ```bash
+  docker node update --label-add mongo=1 --label-add mongo-member=true <node-1>
+  docker node update --label-add mongo=2 --label-add mongo-member=true <node-2>
+  docker node update --label-add mongo=3 --label-add mongo-member=true <node-3>
+  ```
 
-3. Deploy via [`./deploy.sh`](./deploy.sh) — this will:
+   Keep `mongo` unique per node. `mongo-member=true` selects the nodes eligible for the global database service.
+
+3. Ensure your global ACME sync/helper service mounts the `acme_rsync_letsencrypt` volume on every MongoDB node. Run [`scripts/build-mongo-pems.sh`](./scripts/build-mongo-pems.sh) on each ACME sync node (or on the ACME server with `MONGO_OUTPUT_DIR` pointed at the volume's `_data/service/mongo` directory). It scans Certbot live certificates for SANs matching `*.db.<environment>.<domain>.<tld>` and writes these files under `/etc/letsencrypt/service/mongo`:
+
+  - `<MONGO_HORIZON_SUFFIX>.pem`: the matching certificate chain followed by its private key, readable by MongoDB's `mongodb` user.
+  - `root.pem`: the host CA bundle used to validate MongoDB certificates.
+
+  Since this is a node-local Docker volume, it must exist and contain the synchronized files on every node labeled `mongo-member=true`. The certificate must cover `mongoN.db.<MONGO_HORIZON_SUFFIX>`; a SAN wildcard `*.db.<MONGO_HORIZON_SUFFIX>` covers those names. The stack mounts the volume read-only into MongoDB and the existing controller. When the certificate or CA bundle changes, the controller sends `rotateCertificates` directly to each Mongo task over the overlay and verifies the new certificate is being served; failed rotations retry without restarting the replica task. MongoDB uses TLS for external connections and allows non-TLS connections on the private overlay for existing internal services.
+
+  Example cron entry on each ACME sync node (adjust the install path):
+
+  ```cron
+  */5 * * * * /usr/local/sbin/build-mongo-pems.sh >>/var/log/build-mongo-pems.log 2>&1
+  ```
+
+  To run it on the ACME server instead, point its output into the volume that gets rsynced to the Swarm nodes:
+
+  ```cron
+  */5 * * * * MONGO_OUTPUT_DIR=/var/lib/docker/volumes/acme_rsync_letsencrypt/_data/service/mongo /usr/local/sbin/build-mongo-pems.sh >>/var/log/build-mongo-pems.log 2>&1
+  ```
+
+4. Create the DNS A/CNAME records outside the stack so each `mongoN.db.<suffix>` points to the corresponding Swarm node. Ensure TCP port `27017` is reachable only from the intended client networks; the global service publishes that port in host mode on each labeled node.
+
+5. Modify `docker-compose-stack.yml` to include your application service. Use the least-privilege `INITDB_USER` account rather than the Mongo root account, and grant the service the `initdb-password` secret. Configure the application to read `/run/secrets/initdb-password` at startup instead of placing the password in its environment or compose URI. Its internal connection target is `database:27017` with replica set `${REPLICASET_NAME}`.
+
+   External clients should use one of the manually provisioned horizon DNS names with TLS enabled, for example:
+
+  ```
+  mongodb://<INITDB_USER>:<url-encoded-app-password>@mongo1.db.${MONGO_HORIZON_SUFFIX}:27017/?replicaSet=${REPLICASET_NAME}&tls=true
+  ```
+
+6. Build and publish the updated controller image with [`./build.sh`](./build.sh), or update the controller image reference in `docker-compose-stack.yml` to your own built image. The stack must run an image containing the certificate-rotation code.
+
+7. Deploy via [`./deploy.sh`](./deploy.sh) — this will:
     - Import environment variables
     - Create a `backend` overlay network with encryption enabled
-    - Generate a `keyfile` for the replica set and add it as a Docker secret
+    - Generate the replica-set keyfile as a Docker secret
+  - Prompt securely for missing MongoDB passwords and store them as Swarm secrets
     - Spin up all stack services: `mongo`, `dbcontroller`, `nosqlclient`, and your application
-    - Run `dbcontroller` in **global** mode (one instance per Swarm node)
+    - Run MongoDB in **global** mode only on nodes labeled `mongo-member=true`
+    - Configure each member's external horizon as `mongo<mongo-label>.db.<MONGO_HORIZON_SUFFIX>`
 
-4. Monitor logs for output and errors (see [Troubleshooting](#troubleshooting--additional-details)).
+8. Monitor logs for output and errors (see [Troubleshooting](#troubleshooting--additional-details)).
 
-5. To remove the stack:
+9. To remove the stack:
 
     ```bash
     ./remove.sh
@@ -193,14 +232,16 @@ Defined in [`mongo-rs.env`](./mongo-rs.env):
 |----------|---------|---------|
 | `STACK_NAME` | `myapp` | Docker stack name |
 | `MONGO_VERSION` | `8.0.13` | MongoDB image tag |
+| `MONGO_HORIZON_SUFFIX` | `env.domain.tld` | DNS suffix used to build `mongoN.db.<suffix>` horizon addresses |
+| `MONGO_HORIZON_NAME` | `external` | MongoDB horizon key used for TLS clients |
 | `REPLICASET_NAME` | `rs` | Replica set name |
 | `BACKEND_NETWORK_NAME` | `${STACK_NAME}_backend` | Overlay network name |
 | `MONGO_SERVICE_URI` | `${STACK_NAME}_database` | MongoDB service name |
 | `MONGO_ROOT_USERNAME` | `root` | Admin username |
-| `MONGO_ROOT_PASSWORD` | `password123` | Admin password |
 | `INITDB_DATABASE` | `myinitdatabase` | Initial database name |
 | `INITDB_USER` | `mydbuser` | Initial database user |
-| `INITDB_PASSWORD` | `password` | Initial database password |
+
+Passwords are not stored in `mongo-rs.env`. On first deployment, `deploy.sh` prompts for them without echoing input and creates stack-scoped Swarm secrets. The controller reads the password secret files directly; NoSQLClient's image entrypoint reads its default connection URL from a secret file. Swarm secrets are immutable and persist when the stack is removed, so secret rotation requires creating replacement secrets and updating the stack to reference them.
 
 <br>
 

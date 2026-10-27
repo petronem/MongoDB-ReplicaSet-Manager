@@ -1,4 +1,22 @@
 <h1 align="center">
+  <code><strong>Things That This Fork Hopes to Add:</strong></code>
+</h1>
+
+<p align="center">
+  - Allow for external access to Mongo Service without running VPN/etc by using External Horizons w/ rs.Config.
+  <br>
+  - Use Swarm Secrets instead of passwords stored in .Env files
+  <br>
+  - Possibly use Swarm Config(s) to replace deploy.sh
+  <br>
+  <br>
+ <img width="2102" height="846" alt="image" src="https://github.com/user-attachments/assets/4539d82e-35e2-4dc3-a8b5-b3b5a768156b" />
+  <br>
+  <img width="1230" height="1014" alt="image" src="https://github.com/user-attachments/assets/1fd160ba-4db0-49db-8e2d-f950ce19567a" />
+  <br>
+
+</p>
+<h1 align="center">
   <img src="https://img.shields.io/badge/MongoDB-47A248?style=for-the-badge&logo=mongodb&logoColor=white" alt="MongoDB"/>
   <img src="https://img.shields.io/badge/Docker_Swarm-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker Swarm"/>
   <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>

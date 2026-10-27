@@ -1,8 +1,8 @@
 FROM python:3.13-slim
 
 LABEL org.opencontainers.image.title="mongo-replica-ctrl" \
-	  org.opencontainers.image.description="MongoDB ReplicaSet Manager for Docker Swarm" \
-	  org.opencontainers.image.source="https://github.com/BitWise-0x/MongoDB-ReplicaSet-Manager" \
+	  org.opencontainers.image.description="MongoDB ReplicaSet Manager for Docker Swarm w/TLS, Secrets & External Access" \
+	  org.opencontainers.image.source="https://github.com/petronem/MongoDB-ReplicaSet-Manager" \
 	  org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -6,3 +6,4 @@ dockerhub_README.txt
 __pycache__
 .tests
 RUN.md
+mongo-rs.env

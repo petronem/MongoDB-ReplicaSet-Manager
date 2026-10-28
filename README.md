@@ -149,6 +149,7 @@ graph TD
 - Docker Stack recipe — see [`docker-compose-stack.yml`](./docker-compose-stack.yml)
 - Environment variables — see [`mongo-rs.env`](./mongo-rs.env)
 - Deployment script — [`deploy.sh`](./deploy.sh)
+- ACME-DNS server & ACME-rsync global Swarm service --TTD, make the GitHub repos...
 
 <br>
 
@@ -184,7 +185,7 @@ graph TD
   To run it on the ACME server instead, point its output into the volume that gets rsynced to the Swarm nodes:
 
   ```cron
-  */5 * * * * MONGO_OUTPUT_DIR=/var/lib/docker/volumes/acme_rsync_letsencrypt/_data/service/mongo /usr/local/sbin/build-mongo-pems.sh >>/var/log/build-mongo-pems.log 2>&1
+  */5 * * * * MONGO_OUTPUT_DIR=/var/lib/docker/volumes/acme_rsync_letsencrypt/_data/services/mongo /usr/local/sbin/build-mongo-pems.sh >>/var/log/build-mongo-pems.log 2>&1
   ```
 
 4. Create the DNS A/CNAME records outside the stack so each `mongoN.db.<suffix>` points to the corresponding Swarm node. Ensure TCP port `27017` is reachable only from the intended client networks; the global service publishes that port in host mode on each labeled node.
@@ -257,7 +258,7 @@ Passwords are not stored in `mongo-rs.env`. On first deployment, `deploy.sh` pro
 
 The [nosqlclient](https://www.nosqlclient.com/) service included in the recipe provides a web UI at `http://<any-swarm-node-ip>:3030` for browsing and managing the database.
 
-The compose YML pulls the latest controller from DockerHub via [jackietreehorn/mongo-replica-ctrl](https://hub.docker.com/r/jackietreehorn/mongo-replica-ctrl). You can also pull it manually (`docker pull jackietreehorn/mongo-replica-ctrl:latest`) or build locally using the included [`./build.sh`](./build.sh).
+The compose YML pulls the latest controller from DockerHub via [petronem/mongo-replica-ctrl](https://hub.docker.com/r/petronem/mongo-replica-ctrl). You can also pull it manually (`docker pull petronem/mongo-replica-ctrl:latest`) or build locally using the included [`./build.sh`](./build.sh).
 
 <br>
 

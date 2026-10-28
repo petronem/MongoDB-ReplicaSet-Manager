@@ -49,8 +49,8 @@ services:
       MONGO_SERVICE_NAME: ${MONGO_SERVICE_URI}
       MONGO_HORIZON_SUFFIX: ${MONGO_HORIZON_SUFFIX}
       MONGO_HORIZON_NAME: ${MONGO_HORIZON_NAME}
-      MONGO_CERTIFICATE_FILE: /etc/letsencrypt/service/mongo/${MONGO_HORIZON_SUFFIX}.pem
-      MONGO_CA_FILE: /etc/letsencrypt/service/mongo/root.pem
+      MONGO_CERTIFICATE_FILE: /etc/letsencrypt/services/mongo/${MONGO_HORIZON_SUFFIX}.pem
+      MONGO_CA_FILE: /etc/letsencrypt/services/mongo/root.pem
       REPLICASET_NAME: ${REPLICASET_NAME}
       MONGO_PORT: 27017
       MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}

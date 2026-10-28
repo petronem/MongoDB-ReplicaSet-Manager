@@ -282,7 +282,7 @@ def get_task_ip(task, overlay_network_name):
 
 
 def external_horizon_address(member_number, mongo_port, horizon_suffix):
-    return "mongo{}.db.{}:{}".format(member_number, horizon_suffix, mongo_port)
+    return "mongo{}.{}:{}".format(member_number, horizon_suffix, mongo_port)
 
 
 def get_certificate_fingerprint(certificate_file):

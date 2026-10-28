@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 
+#
+# run as cronjob on acme-dns server to build mongo pem files from certbot certs
+# output gets pulled into docker swarm by acme_rsync global service <external code not in this repo>
+#
+
 set -euo pipefail
 
 LE_LIVE_DIR=${LE_LIVE_DIR:-/etc/letsencrypt/live}
-MONGO_OUTPUT_DIR=${MONGO_OUTPUT_DIR:-/etc/letsencrypt/service/mongo}
-MONGO_ROOT_CA_SOURCE=${MONGO_ROOT_CA_SOURCE:-/etc/ssl/certs/ca-certificates.crt}
+MONGO_OUTPUT_DIR=${MONGO_OUTPUT_DIR:-/etc/letsencrypt/services/mongo}
+MONGO_ROOT_CA_SOURCE=${MONGO_ROOT_CA_SOURCE:-/etc/pki/ca-trust/extracted/pem/directory-hash/ca-certificates.crt}
+
+ #-/etc/ssl/certs/ca-certificates.crt}
 MONGO_UID=${MONGO_UID:-999}
 MONGO_GID=${MONGO_GID:-999}
 
@@ -58,7 +65,7 @@ if (( ${#best_cert[@]} == 0 )); then
 fi
 
 write_bundle() {
-    local suffix=$1
+    local suffix="db."$1
     local cert_file=$2
     local key_file=$3
     local destination="$MONGO_OUTPUT_DIR/$suffix.pem"

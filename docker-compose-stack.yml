@@ -2,7 +2,7 @@ version: '3.9'
 services:
   database:
     image: mongo:${MONGO_VERSION}
-    entrypoint: [ "/usr/bin/mongod", "--keyFile", "/run/secrets/mongo-keyfile", "--replSet", "${REPLICASET_NAME}", "--dbpath", "/data/db", "--bind_ip", "0.0.0.0", "--tlsMode", "allowTLS", "--tlsCertificateKeyFile", "/etc/letsencrypt/services/mongo/${MONGO_HORIZON_SUFFIX}.pem", "--tlsCAFile", "/etc/letsencrypt/services/mongo/root.pem", "--tlsAllowInvalidHostnames", "--tlsAllowInvalidCertificates"]
+    entrypoint: [ "/usr/bin/mongod", "--keyFile", "/run/secrets/mongo-keyfile", "--replSet", "${REPLICASET_NAME}", "--dbpath", "/data/db", "--bind_ip", "0.0.0.0", "--tlsMode", "allowTLS", "--tlsCertificateKeyFile", "/etc/letsencrypt/services/mongo/${MONGO_HORIZON_SUFFIX}.pem", "--tlsCAFile", "/etc/letsencrypt/services/mongo/root.pem", "--tlsAllowInvalidHostnames", "--tlsAllowInvalidCertificates",  "--tlsAllowConnectionsWithoutCertificates"]
     secrets:
       - source: mongo-keyfile
         uid: "999"

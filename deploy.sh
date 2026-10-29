@@ -7,7 +7,7 @@ set +o allexport
 
 # Use to avoid subnet overlaps - specify your own subnet
 if ! docker network inspect "$BACKEND_NETWORK_NAME" >/dev/null 2>&1; then
-	docker network create --opt "$BACKEND_NETWORK_OPTIONS" -d overlay --subnet="$BACKEND_NETWORK_SUBNET" --gateway="$BACKEND_NETWORK_GATEWAY" "$BACKEND_NETWORK_NAME"
+	docker network create $BACKEND_NETWORK_OPTIONS -d overlay --subnet="$BACKEND_NETWORK_SUBNET" --gateway="$BACKEND_NETWORK_GATEWAY" "$BACKEND_NETWORK_NAME"
 fi
 # docker network create --opt encrypted -d overlay ${BACKEND_NETWORK_NAME}
 
